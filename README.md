@@ -1,8 +1,9 @@
-# QApply Testing
+# To test this please combine this repo with my other repo QApply frontend
 
 
 
-## Getting started
+
+## Disclaimer: localhost is harcoded so please run on localhost
 
 **Following django project file structure**
 <img title="File structure" alt="This screenshot from django shows the file structure" src="./struct.png">
