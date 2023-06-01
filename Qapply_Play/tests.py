@@ -19,7 +19,8 @@ class TimeAPITests(TestCase):
         # Assert
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json()['time'], expected_time.strftime('%Y-%m-%d %H:%M:%S'))
-        self.assertGreater(datetime.datetime.strptime(response.json()['time'], '%Y-%m-%d %H:%M:%S'), expected_time)
+        self.assertGreater(response.json()['time'], expected_time)
+
 
 if __name__ == '__main__':
     main()
