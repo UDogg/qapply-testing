@@ -1,7 +1,7 @@
 # To test this please combine this repo with my other repo QApply frontend
 
 
-
+## This app does not have a landing/front page. It just launches to RESTful APIs with Django REST framework
 
 ## Disclaimer: localhost is harcoded so please run on localhost
 
