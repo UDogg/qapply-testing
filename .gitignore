@@ -1,0 +1,57 @@
+# macOS-specific files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Icon must end with two \r
+Icon
+
+# Thumbnails
+._*
+
+# Files that might appear on external disk
+.Spotlight-V100
+.Trashes
+
+# Directory configuration files
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+# Ignore system files
+*.pyc
+__pycache__/
+*.swp
+*.swo
+
+# Ignore database files
+*.db
+*.sqlite3
+
+# Ignore static files collected by Django
+/static/
+
+# Ignore media files uploaded by users
+/media/
+
+# Ignore log files
+/log/
+
+# Ignore environment-specific settings
+.env
+
+# Ignore IDE-specific files
+.idea/
+.vscode/
+
+# Ignore local development settings
+/local_settings.py
+
+# Ignore compiled Python files
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environment
+venv/
