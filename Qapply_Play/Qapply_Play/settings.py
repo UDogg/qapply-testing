@@ -42,7 +42,6 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = 'Qapply_Play.urls'
-import os
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
