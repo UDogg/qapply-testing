@@ -1,612 +1,399 @@
 #!/usr/bin/env python3
+"""
+Sophisticated Chaos Engineering Stress Tester with Adaptive Throttling,
+Prometheus Telemetry, Redis Caching, Circuit Breaking, Socket-Level Optimizations,
+In-Script Profiling, and Kubernetes Chaos Integration.
 
-import requests
-import concurrent.futures
+This script generates configurable high-concurrency HTTP load, monitors errors,
+adapts request rates, caches GET responses, breaks circuits on repeated failures,
+and periodically terminates Kubernetes pods to inject chaos.
+"""
+
+import os
 import time
 import random
-import statistics
 import logging
-import collections
 import socket
 import threading
 import signal
 import sys
-from typing import List, Tuple, Optional, Dict, Any, Deque, NamedTuple
-from urllib3.exceptions import NewConnectionError
-from requests.adapters import HTTPAdapter
+import statistics
+import collections
+from typing import List, Optional, Deque, NamedTuple, Tuple
+import requests
+import redis
+import pybreaker
+import kubernetes.client
+from kubernetes import config as kube_config
 from urllib3.util.retry import Retry
-
-# --- Result Data Structure ---
-class RequestResult(NamedTuple):
-    """Holds the detailed outcome of a single HTTP request attempt."""
-    status_code: Optional[int]
-    latency_ms: Optional[float]
-    success: bool
-    error_type: Optional[str] # e.g., 'Timeout', 'ConnectionError', 'HTTP 503', 'SSL Error'
-    thread_name: str
-    timestamp: float # Time when the request finished
-    content_length: Optional[int] = -1 # Optional: size of response body
-    is_retry: bool = False # Was this result from a retry attempt?
+from requests.adapters import HTTPAdapter
+from prometheus_client import start_http_server, Counter, Histogram, Gauge
+from urllib3.exceptions import NewConnectionError
+import concurrent.futures
+from subprocess import Popen
 
 # --- Configuration ---
-# --- Core Settings ---
-TARGET_URL = "http://localhost:8000"  # <<<*** REPLACE WITH YOUR TARGET URL ***>>>
-# TARGET_URL = "https://httpbin.org/delay/1" # Example that introduces delay
-NUM_REQUESTS = 5000   # Total synthetic requests to dispatch
-NUM_WORKERS = 100     # Number of concurrent worker threads (adjust based on client resources)
+TARGET_URL = os.getenv('TARGET_URL', 'http://localhost:8000')
+NUM_REQUESTS = int(os.getenv('NUM_REQUESTS', '5000'))
+NUM_WORKERS = int(os.getenv('NUM_WORKERS', '100'))
 
-# --- Request Behavior ---
-REQUEST_METHOD = "GET" # Could be GET, POST, PUT, etc. (POST/PUT would need data)
-REQUEST_HEADERS = {    # Custom headers if needed
+REQUEST_METHOD = 'GET'
+REQUEST_HEADERS = {
     'User-Agent': 'EnhancedPythonStressTester/1.0',
     'Accept': '*/*',
-    # 'Authorization': 'Bearer YOUR_TOKEN' # Example
 }
-CONNECT_TIMEOUT = 5.0  # Seconds to wait for connection establishment
-READ_TIMEOUT = 15.0    # Seconds to wait for the server to send data after connection
-ALLOW_REDIRECTS = True # Follow HTTP redirects (3xx)
-VERIFY_SSL = True      # Verify SSL certificates. WARNING: False is insecure, only for trusted test envs.
-STREAM_RESPONSE = False # If True, doesn't download body immediately. Useful for large files or just checking headers.
+CONNECT_TIMEOUT = float(os.getenv('CONNECT_TIMEOUT', '5.0'))
+READ_TIMEOUT = float(os.getenv('READ_TIMEOUT', '15.0'))
+ALLOW_REDIRECTS = True
+VERIFY_SSL = True
+STREAM_RESPONSE = False
 
-# --- Retry Logic ---
-ENABLE_RETRIES = True # Enable automatic retries for specific conditions
-MAX_RETRIES = 3       # Maximum number of retries per request
-RETRY_BACKOFF_FACTOR = 0.5 # Backoff delay = {backoff factor} * (2 ** ({number of total retries} - 1))
-RETRY_ON_STATUS_CODES = {500, 502, 503, 504} # HTTP status codes to retry on
-RETRY_ON_CONNECTION_ERRORS = True # Retry on connection errors/timeouts?
+ENABLE_RETRIES = True
+MAX_RETRIES = 3
+RETRY_BACKOFF_FACTOR = 0.5
+RETRY_ON_STATUS_CODES = {500, 502, 503, 504}
 
-# --- Adaptive Throttling ---
 ENABLE_ADAPTIVE_THROTTLING = True
-ERROR_THRESHOLD = 0.05 # Trigger backoff if error rate exceeds 5% over the window
-THROTTLING_WINDOW_SIZE = 200 # Calculate error rate based on the last N results
-BACKOFF_WINDOW_BASE = 0.1 # Starting backoff delay in seconds
-BACKOFF_WINDOW_MAX = 10.0 # Maximum seconds for exponential backoff window
+ERROR_THRESHOLD = 0.05
+THROTTLING_WINDOW_SIZE = 200
+BACKOFF_WINDOW_BASE = 0.1
+BACKOFF_WINDOW_MAX = 10.0
 
-# --- Analysis & Reporting ---
-LATENCY_PERCENTILES = [50, 75, 90, 95, 99, 99.9] # Percentiles to calculate
-LOG_LEVEL = logging.INFO # DEBUG, INFO, WARNING, ERROR
+# Redis for caching & circuit breaker state
+REDIS_HOST = os.getenv('REDIS_HOST', 'redis-cache')
+REDIS_PORT = int(os.getenv('REDIS_PORT', '6379'))
+REDIS_DB = 0
+CACHE_TTL = 300  # seconds
+REDIS_CLIENT = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+CIRCUIT_BREAKER = pybreaker.CircuitBreaker(
+    fail_max=5,
+    reset_timeout=30,
+    state_storage=pybreaker.CircuitBreakerRedisStorage(REDIS_CLIENT)
+)
 
-# --- Global State & Control ---
-# Using Deque for efficient append/popleft, suitable for sliding window
-results_store: Deque[RequestResult] = collections.deque()
-# This deque specifically for the *adaptive throttling* error rate calculation
-throttling_error_window: Deque[bool] = collections.deque(maxlen=THROTTLING_WINDOW_SIZE)
-# Thread-local storage for session objects to ensure thread safety and connection pooling per thread
-thread_local_data = threading.local()
-# Graceful shutdown flag
-shutdown_event = threading.Event()
-# Keep track of submitted futures for graceful shutdown
-active_futures: List[concurrent.futures.Future] = []
-# Lock for safely appending to shared results_store and managing active_futures list
-results_lock = threading.Lock()
+# Prometheus metrics
+REQUEST_COUNTER = Counter('http_requests_total', 'Total HTTP requests', ['method','status','endpoint'])
+LATENCY_HISTOGRAM = Histogram('http_request_duration_seconds','Request latency', ['endpoint'])
+ERROR_GAUGE      = Gauge('consecutive_errors','Consecutive error streak')
+TOKEN_BUCKET_GAUGE = Gauge('throttle_tokens','Available leaky bucket tokens')
 
-# --- Logging Setup ---
+# Kubernetes chaos settings
+CHAOS_NAMESPACE = os.getenv('CHAOS_NAMESPACE', 'production')
+CHAOS_LABEL_SELECTOR = os.getenv('CHAOS_LABEL_SELECTOR', 'app=critical-service')
+CHAOS_INTERVAL_MIN = 30
+CHAOS_INTERVAL_MAX = 120
+
+# Analysis percentiles
+LATENCY_PERCENTILES = [50, 75, 90, 95, 99, 99.9]
+
+# Logging
 logging.basicConfig(
-    level=LOG_LEVEL,
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(threadName)s] - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-# Suppress overly verbose logs from underlying libraries if desired
-# logging.getLogger("urllib3").setLevel(logging.WARNING)
-# logging.getLogger("requests").setLevel(logging.WARNING)
 
-# --- Utility Functions ---
-def get_request_session() -> requests.Session:
-    """
-    Creates or retrieves a requests.Session object for the current thread.
-    Configures session-level settings like retries and potential custom adapters.
-    """
-    if not hasattr(thread_local_data, 'session'):
-        logging.debug("Creating new requests.Session for thread %s", threading.current_thread().name)
-        session = requests.Session()
-        session.headers.update(REQUEST_HEADERS)
+# Shared state
+results_store: Deque['RequestResult'] = collections.deque()
+throttling_error_window: Deque[bool] = collections.deque(maxlen=THROTTLING_WINDOW_SIZE)
+thread_local = threading.local()
+shutdown_event = threading.Event()
+active_futures: List[concurrent.futures.Future] = []
+results_lock = threading.Lock()
 
-        adapter_args = {}
+class RequestResult(NamedTuple):
+    status_code: Optional[int]
+    latency_ms: Optional[float]
+    success: bool
+    error_type: Optional[str]
+    thread_name: str
+    timestamp: float
+    content_length: int = -1
+    is_retry: bool = False
 
-        # --- Optimization: Configure Retries (if enabled) ---
-        # Leverage built-in urllib3 retries within requests Session
+# --- Profiling Decorator ---
+def profile(fn):
+    """Profiles function execution using cProfile + dumps stats."""
+    def wrapper(*args, **kwargs):
+        import cProfile
+        profiler = cProfile.Profile()
+        profiler.enable()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            profiler.disable()
+            stats_path = f'/profiles/{fn.__name__}.prof'
+            profiler.dump_stats(stats_path)
+            logging.info(f'Profile data written to {stats_path}')
+    return wrapper
+
+# --- Leaky Bucket Throttler ---
+class LeakyBucket:
+    def __init__(self, capacity: int, leak_rate: float):
+        self.capacity = capacity
+        self.tokens = capacity
+        self.leak_rate = leak_rate
+        self.last_check = time.monotonic()
+
+    def consume(self, amount: int = 1) -> bool:
+        now = time.monotonic()
+        elapsed = now - self.last_check
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.leak_rate)
+        self.last_check = now
+        TOKEN_BUCKET_GAUGE.set(self.tokens)
+        if self.tokens >= amount:
+            self.tokens -= amount
+            return True
+        return False
+
+# --- ChaosMonkey ---
+class ChaosMonkey:
+    def __init__(self):
+        kube_config.load_incluster_config()
+        self.core_v1 = kubernetes.client.CoreV1Api()
+
+    def terminate_random_pod(self):
+        pods = self.core_v1.list_namespaced_pod(
+            namespace=CHAOS_NAMESPACE,
+            label_selector=CHAOS_LABEL_SELECTOR
+        ).items
+        if not pods:
+            return
+        victim = random.choice(pods)
+        self.core_v1.delete_namespaced_pod(
+            name=victim.metadata.name,
+            namespace=CHAOS_NAMESPACE
+        )
+        logging.warning(f"Chaos: Terminated pod {victim.metadata.name}")
+
+# --- CachedSession with socket opts, retries, circuit breaker, caching ---
+class CachedSession(requests.Session):
+    def __init__(self):
+        super().__init__()
+        # Custom adapter for socket options + retries
+        class SocketOptionsAdapter(HTTPAdapter):
+            def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+                opts = [
+                    (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+                    (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                ]
+                pool_kwargs['socket_options'] = opts
+                super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
         if ENABLE_RETRIES:
             retry_strategy = Retry(
                 total=MAX_RETRIES,
                 status_forcelist=RETRY_ON_STATUS_CODES,
                 backoff_factor=RETRY_BACKOFF_FACTOR,
-                method_whitelist=["HEAD", "GET", "OPTIONS", "POST", "PUT", "DELETE"], # Methods to retry on
-                # Note: Retry on connection errors is implicitly handled by `total` unless specifically disabled.
-                # We rely on catching exceptions later for connection error categorization if needed.
+                allowed_methods=["HEAD","GET","OPTIONS","POST","PUT","DELETE"]
             )
-            # Mount it for both http and https prefixes
-            adapter_args['max_retries'] = retry_strategy
+            adapter = SocketOptionsAdapter(max_retries=retry_strategy)
+        else:
+            adapter = SocketOptionsAdapter()
 
-        # --- Optimization: Custom Adapter for Socket Options (Advanced Example) ---
-        # Uncomment and customize if needed. This adds complexity.
-        # class SocketOptionsAdapter(HTTPAdapter):
-        #     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        #         socket_options = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)] # Example: Enable TCP_NODELAY
-        #         # Add SO_REUSEADDR if needed, though more relevant server-side usually
-        #         # socket_options.append((socket.SOL_SOCKET, socket.SO_REUSEADDR, 1))
-        #         pool_kwargs['socket_options'] = socket_options
-        #         super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
-        # adapter = SocketOptionsAdapter(**adapter_args)
+        self.mount('http://', adapter)
+        self.mount('https://', adapter)
 
-        # --- Standard Adapter with Retries ---
-        adapter = HTTPAdapter(**adapter_args)
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
+    @CIRCUIT_BREAKER
+    def request(self, method, url, **kwargs):
+        if method.upper() == 'GET':
+            cached = REDIS_CLIENT.get(url)
+            if cached:
+                resp = requests.Response._from_cache(cached)
+                resp._cached = True
+                return resp
+        resp = super().request(method, url, **kwargs)
+        if method.upper() == 'GET' and resp.status_code == 200:
+            REDIS_CLIENT.setex(url, CACHE_TTL, resp._to_cache())
+        return resp
 
-        thread_local_data.session = session
-    return thread_local_data.session
+# Thread-local session
 
-# --- Phase 1: Flood Generation & Request Execution ---
-def make_request(url: str, request_id: int, is_retry_attempt: bool = False) -> RequestResult:
-    """
-    Sends a single HTTP request using the thread-local session, measures latency,
-    handles various errors, and returns a detailed result object.
+def get_request_session() -> requests.Session:
+    if not hasattr(thread_local, 'session'):
+        session = CachedSession()
+        session.headers.update(REQUEST_HEADERS)
+        thread_local.session = session
+    return thread_local.session
 
-    Args:
-        url: The target URL.
-        request_id: A unique identifier for logging/tracking this specific request attempt.
-        is_retry_attempt: Flag indicating if this call is a retry.
-
-    Returns:
-        RequestResult containing the outcome.
-    """
-    start_time = time.monotonic()
+# --- Phase 1: Make Request ---
+def make_request(request_id: int, is_retry: bool=False) -> RequestResult:
+    start = time.monotonic()
     session = get_request_session()
-    thread_name = threading.current_thread().name
-    status_code: Optional[int] = None
-    latency_ms: Optional[float] = None
+    thread = threading.current_thread().name
+    status_code = None
+    latency_ms = None
     success = False
-    error_type: Optional[str] = None
-    content_length: Optional[int] = -1
-    response: Optional[requests.Response] = None
+    error_type = None
+    content_length = -1
 
     try:
-        logging.debug(f"Req {request_id}: Attempting {REQUEST_METHOD} to {url}")
-        response = session.request(
-            method=REQUEST_METHOD,
-            url=url,
-            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-            allow_redirects=ALLOW_REDIRECTS,
-            verify=VERIFY_SSL,
-            stream=STREAM_RESPONSE, # Process response differently if streaming
-            # data=payload if REQUEST_METHOD in ['POST', 'PUT'] else None # Add payload if needed
-        )
-        latency_ms = (time.monotonic() - start_time) * 1000
-        status_code = response.status_code
-
-        # Determine success based on status code
+        with LATENCY_HISTOGRAM.labels(TARGET_URL).time():
+            resp = session.request(
+                method=REQUEST_METHOD,
+                url=TARGET_URL,
+                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+                allow_redirects=ALLOW_REDIRECTS,
+                verify=VERIFY_SSL,
+                stream=STREAM_RESPONSE
+            )
+        latency_ms = (time.monotonic() - start) * 1000
+        status_code = resp.status_code
+        REQUEST_COUNTER.labels(REQUEST_METHOD, status_code, TARGET_URL).inc()
         if 200 <= status_code < 300:
             success = True
-            logging.debug(f"Req {request_id}: Success ({status_code}), Latency: {latency_ms:.2f} ms")
         else:
-            success = False
             error_type = f"HTTP {status_code}"
-            logging.warning(f"Req {request_id}: Failure ({error_type}), Latency: {latency_ms:.2f} ms")
-
-        # Handle streamed response if enabled
+            logging.warning(f"Req {request_id}: {error_type} in {latency_ms:.2f}ms")
         if STREAM_RESPONSE:
-            try:
-                # Try to get content length without downloading body
-                cl = response.headers.get('Content-Length')
-                content_length = int(cl) if cl is not None else -1
-                # Consume the body to free the connection, even if streaming
-                # response.raise_for_status() # Optional: raise exception for bad status codes immediately
-                for _ in response.iter_content(chunk_size=8192):
-                    pass # Just consume
-            except Exception as stream_exc:
-                 # Handle potential errors during stream consumption
-                 success = False # Mark as failure if stream consumption fails
-                 error_type = f"Stream Error ({type(stream_exc).__name__})"
-                 logging.error(f"Req {request_id}: Error consuming streamed response: {stream_exc}")
-            finally:
-                response.close() # Ensure connection is released
+            cl = resp.headers.get('Content-Length')
+            content_length = int(cl) if cl else -1
+            for _ in resp.iter_content(8192): pass
+            resp.close()
         else:
-             # Get content length for non-streamed responses
-            try:
-                content_length = len(response.content)
-            except Exception:
-                 content_length = -1 # Handle cases where content is not available/error
+            content_length = len(resp.content)
 
-        # Explicitly raise status for non-2xx codes if not automatically retried
-        # Note: The Retry logic in the adapter might handle some cases automatically.
-        # If status is bad here, it means retries (if enabled) were exhausted or status not configured for retry.
-        # response.raise_for_status() # We log it as an error instead of raising here
-
-
-    # --- Granular Error Handling ---
+    except pybreaker.CircuitBreakerError:
+        ERROR_GAUGE.inc()
+        error_type = 'CircuitOpen'
     except requests.exceptions.Timeout as e:
-        # Catches both ConnectTimeout and ReadTimeout
-        latency_ms = (time.monotonic() - start_time) * 1000
-        success = False
+        latency_ms = (time.monotonic() - start) * 1000
         error_type = f"Timeout ({type(e).__name__})"
-        logging.warning(f"Req {request_id}: {error_type}, Latency: {latency_ms:.2f} ms")
+        logging.warning(f"Req {request_id}: {error_type}")
     except requests.exceptions.ConnectionError as e:
-        # Covers DNS errors, refused connections, etc.
-        # NewConnectionError is a subclass often seen
-        latency_ms = (time.monotonic() - start_time) * 1000
-        success = False
-        error_type = f"ConnectionError ({type(e).__name__})"
-        # Log specific underlying error if available (e.g., from urllib3)
+        latency_ms = (time.monotonic() - start) * 1000
         if isinstance(e.args[0], NewConnectionError):
-             error_type += f" - {e.args[0]}" # More specific info
-        logging.warning(f"Req {request_id}: {error_type}, Latency: {latency_ms:.2f} ms")
-    except requests.exceptions.SSLError as e:
-        latency_ms = (time.monotonic() - start_time) * 1000
-        success = False
-        error_type = f"SSLError"
-        logging.error(f"Req {request_id}: SSL Verification failed: {e}")
-    except requests.exceptions.TooManyRedirects as e:
-        latency_ms = (time.monotonic() - start_time) * 1000
-        success = False
-        error_type = "TooManyRedirects"
-        logging.warning(f"Req {request_id}: Exceeded max redirects. Check URL or {ALLOW_REDIRECTS=}. Error: {e}")
-    except requests.exceptions.RequestException as e:
-        # Catch-all for other requests-related errors (InvalidURL, ChunkedEncodingError, etc.)
-        latency_ms = (time.monotonic() - start_time) * 1000
-        success = False
-        error_type = f"RequestException ({type(e).__name__})"
-        logging.error(f"Req {request_id}: General request error: {e}", exc_info=False) # exc_info=True for full traceback
+            error_type = f"ConnError - {e.args[0]}"
+        else:
+            error_type = f"ConnectionError ({type(e).__name__})"
+        logging.warning(f"Req {request_id}: {error_type}")
     except Exception as e:
-        # Catch unexpected errors within the function
-        latency_ms = (time.monotonic() - start_time) * 1000
-        success = False
-        error_type = f"UnexpectedError ({type(e).__name__})"
-        logging.exception(f"Req {request_id}: An unexpected error occurred: {e}") # Log full traceback for unexpected
-    finally:
-        # Ensure response is closed if it exists and streaming wasn't used (or failed)
-        if response and not STREAM_RESPONSE:
-            response.close()
+        latency_ms = (time.monotonic() - start) * 1000
+        error_type = f"Unexpected ({type(e).__name__})"
+        logging.exception("Unexpected error")
 
-    # --- Record Result ---
     result = RequestResult(
         status_code=status_code,
         latency_ms=latency_ms,
         success=success,
         error_type=error_type,
-        thread_name=thread_name,
-        timestamp=time.time(), # Use wall clock time for timestamping results
+        thread_name=thread,
+        timestamp=time.time(),
         content_length=content_length,
-        is_retry=is_retry_attempt
+        is_retry=is_retry
     )
-
-    # Safely append to shared data structures
     with results_lock:
         results_store.append(result)
-        # Update the throttling window (only tracks success/failure)
-        throttling_error_window.append(not success) # Append True if error, False if success
-
+        throttling_error_window.append(not success)
     return result
 
-
-# --- Phase 2: Telemetry Pipeline (Enhanced Analysis) ---
-def analyze_results(results: Deque[RequestResult], duration_sec: float):
-    """
-    Calculates and logs detailed statistics from the collected results.
-
-    Args:
-        results: Deque containing RequestResult objects.
-        duration_sec: The total duration of the test execution phase.
-    """
+# --- Phase 2: Telemetry Analysis ---
+def analyze_results(results: Deque[RequestResult], duration: float):
     logging.info("--- Phase 2: Telemetry Analysis ---")
-
     if not results:
-        logging.warning("No results collected to analyze.")
+        logging.warning("No results to analyze.")
         return
-
-    total_completed = len(results)
-    logging.info(f"Analysis based on {total_completed} completed requests over {duration_sec:.2f} seconds.")
-
-    # Calculate overall Requests Per Second (RPS)
-    if duration_sec > 0:
-        overall_rps = total_completed / duration_sec
-        logging.info(f"Overall Average RPS: {overall_rps:.2f}")
-    else:
-        logging.info("Overall Average RPS: N/A (duration too short)")
-
-
-    status_codes = collections.defaultdict(int)
-    error_types = collections.defaultdict(int)
-    latencies_ms: List[float] = []
-    content_lengths: List[int] = []
-    success_count = 0
-    retry_attempts_recorded = 0 # Note: This counts results marked as retries, not total attempts
-
-    for res in results:
-        if res.latency_ms is not None:
-            latencies_ms.append(res.latency_ms)
-        if res.status_code is not None:
-            status_codes[res.status_code] += 1
-        if res.success:
-            success_count += 1
-        else:
-            error_key = res.error_type if res.error_type else "Unknown Error"
-            error_types[error_key] += 1
-        if res.content_length is not None and res.content_length >= 0:
-             content_lengths.append(res.content_length)
-        if res.is_retry:
-            retry_attempts_recorded += 1 # Count results that were the product of a retry
-
-
-    failure_count = total_completed - success_count
-    logging.info(f"Successful Requests: {success_count}")
-    logging.info(f"Failed Requests: {failure_count}")
-    if total_completed > 0:
-        logging.info(f"Success Rate: {success_count / total_completed:.2%}")
-    # if ENABLE_RETRIES:
-        # logging.info(f"Retry Results Recorded: {retry_attempts_recorded} (Note: Represents successful retries or final failed retries)")
-
-
-    logging.info("\n--- Status Code Distribution ---")
-    if status_codes:
-        for code, count in sorted(status_codes.items()):
-            logging.info(f"  HTTP {code}: {count} ({count / total_completed:.2%})")
-    else:
-        logging.info("  No status codes recorded.")
-
-    logging.info("\n--- Error Types Breakdown ---")
-    if error_types:
-        for err_type, count in sorted(error_types.items(), key=lambda item: item[1], reverse=True):
-            logging.info(f"  {err_type}: {count} ({count / total_completed:.2%})")
-    else:
-        logging.info("  No errors recorded.")
-
-
-    logging.info("\n--- Latency Statistics (ms) ---")
-    if latencies_ms:
-        latencies_ms.sort() # Sort for percentile calculation
-        min_lat = latencies_ms[0]
-        max_lat = latencies_ms[-1]
-        avg_lat = statistics.mean(latencies_ms)
-        median_lat = statistics.median(latencies_ms)
-        stdev_lat = statistics.stdev(latencies_ms) if len(latencies_ms) > 1 else 0.0
-
-        logging.info(f"  Count: {len(latencies_ms)}")
-        logging.info(f"  Min: {min_lat:.2f}")
-        logging.info(f"  Average: {avg_lat:.2f}")
-        logging.info(f"  Median: {median_lat:.2f}")
-        logging.info(f"  Max: {max_lat:.2f}")
-        logging.info(f"  Std Dev: {stdev_lat:.2f}")
-
-        logging.info("  Percentiles:")
-        # Calculate requested percentiles efficiently on sorted list
+    total = len(results)
+    logging.info(f"Completed {total} requests in {duration:.2f}s (avg RPS: {total/duration:.2f})")
+    codes = collections.Counter(r.status_code for r in results if r.status_code is not None)
+    errors = collections.Counter(r.error_type or 'Unknown' for r in results if not r.success)
+    logging.info("Status codes distribution:")
+    for code, cnt in codes.items():
+        logging.info(f"  {code}: {cnt} ({cnt/total:.2%})")
+    logging.info("Error types:")
+    for et, cnt in errors.items():
+        logging.info(f"  {et}: {cnt} ({cnt/total:.2%})")
+    lat = sorted(r.latency_ms for r in results if r.latency_ms is not None)
+    if lat:
+        logging.info(f"Latency ms: min {min(lat):.2f}, avg {statistics.mean(lat):.2f}, max {max(lat):.2f}")
         for p in LATENCY_PERCENTILES:
-            try:
-                # Simple percentile calculation (index = p/100 * N)
-                idx = int(len(latencies_ms) * (p / 100.0))
-                # Clamp index to valid range [0, N-1]
-                idx = max(0, min(idx, len(latencies_ms) - 1))
-                p_val = latencies_ms[idx]
-                logging.info(f"  {p}th: {p_val:.2f}")
-            except IndexError:
-                logging.warning(f"Could not calculate {p}th percentile (not enough data).")
-            except Exception as e:
-                 logging.error(f"Error calculating {p}th percentile: {e}")
-
-    else:
-        logging.info("  No latency data recorded.")
-
-
-    logging.info("\n--- Content Length Statistics (bytes) ---")
-    if content_lengths:
-        min_len = min(content_lengths)
-        max_len = max(content_lengths)
-        avg_len = statistics.mean(content_lengths)
-        median_len = statistics.median(content_lengths)
-        stdev_len = statistics.stdev(content_lengths) if len(content_lengths) > 1 else 0.0
-
-        logging.info(f"  Count: {len(content_lengths)}")
-        logging.info(f"  Min: {min_len}")
-        logging.info(f"  Average: {avg_len:.2f}")
-        logging.info(f"  Median: {median_len:.0f}")
-        logging.info(f"  Max: {max_len}")
-        logging.info(f"  Std Dev: {stdev_len:.2f}")
-    else:
-        logging.info("  No content length data recorded.")
-
-
+            idx = min(int(len(lat)*(p/100)), len(lat)-1)
+            logging.info(f"  {p}th percentile: {lat[idx]:.2f}")
+    clens = [r.content_length for r in results if r.content_length>=0]
+    if clens:
+        logging.info(f"Content length bytes: min {min(clens)}, avg {statistics.mean(clens):.2f}, max {max(clens)}")
     logging.info("--- End Telemetry Analysis ---")
 
 # --- Phase 3: Adaptive Throttling ---
-def check_and_apply_throttling(current_error_rate: float, backoff_level: int) -> Tuple[int, float]:
-    """
-    Checks if the error rate exceeds the threshold and applies exponential backoff.
+def check_and_apply_throttling(level: int) -> Tuple[int, float]:
+    if ENABLE_ADAPTIVE_THROTTLING and len(throttling_error_window) == THROTTLING_WINDOW_SIZE:
+        err_rate = sum(throttling_error_window)/THROTTLING_WINDOW_SIZE
+        if err_rate > ERROR_THRESHOLD:
+            level += 1
+            base = min(BACKOFF_WINDOW_MAX, BACKOFF_WINDOW_BASE * (2**level))
+            sleep = min(BACKOFF_WINDOW_MAX, base + random.uniform(0, base*0.3))
+            logging.warning(f"Throttling: err_rate {err_rate:.2%} > {ERROR_THRESHOLD:.1%}, sleeping {sleep:.2f}s")
+            time.sleep(sleep)
+            return level, sleep
+        if level>0:
+            logging.info(f"Err_rate {err_rate:.2%} <= threshold, resetting backoff")
+            level = 0
+    return level, 0.0
 
-    Args:
-        current_error_rate: The calculated error rate over the window.
-        backoff_level: The current level/attempt number for backoff calculation.
-
-    Returns:
-        Tuple containing the updated backoff_level and the calculated sleep_duration.
-    """
-    sleep_duration = 0.0
-    if ENABLE_ADAPTIVE_THROTTLING and current_error_rate > ERROR_THRESHOLD:
-        backoff_level += 1
-        # Exponential backoff with jitter
-        base_delay = min(BACKOFF_WINDOW_MAX, BACKOFF_WINDOW_BASE * (2 ** backoff_level))
-        jitter = random.uniform(0, base_delay * 0.3) # Add jitter (e.g., up to 30%)
-        sleep_duration = min(BACKOFF_WINDOW_MAX, base_delay + jitter) # Ensure max isn't exceeded
-
-        logging.warning(
-            f"Throttling: Error rate ({current_error_rate:.2%}) > threshold ({ERROR_THRESHOLD:.1%}). "
-            f"Backing off for {sleep_duration:.3f} seconds (Level {backoff_level})."
-        )
-        time.sleep(sleep_duration)
-    elif backoff_level > 0:
-        # Reset backoff level if error rate is acceptable again
-        logging.info(f"Throttling: Error rate ({current_error_rate:.2%}) <= threshold ({ERROR_THRESHOLD:.1%}). Resuming normal rate.")
-        backoff_level = 0
-
-    return backoff_level, sleep_duration
-
-# --- Main Orchestration & Graceful Shutdown ---
-def run_stress_test(url: str, total_requests_target: int, num_workers: int):
-    """
-    Orchestrates the concurrent request generation, manages workers,
-    applies throttling, and handles graceful shutdown.
-    """
-    log_config_details()
-    logging.info(f"--- Starting Stress Test ---")
-
-    # Using ThreadPoolExecutor for I/O-bound concurrency
-    # Worker threads will be created up to num_workers as needed
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix='StressWorker')
-
-    requests_submitted = 0
-    backoff_level = 0
-    last_progress_log_time = time.monotonic()
-    last_progress_req_count = 0
-
-    global active_futures
-    start_time = time.monotonic()
-
-    try:
-        while requests_submitted < total_requests_target:
-            if shutdown_event.is_set():
-                logging.warning("Shutdown signal received. Stopping submission of new requests.")
-                break
-
-            # --- Adaptive Throttling Check ---
-            current_error_rate = 0.0
-            with results_lock: # Access throttling window safely
-                if len(throttling_error_window) == THROTTLING_WINDOW_SIZE:
-                    recent_errors = sum(1 for is_error in throttling_error_window if is_error)
-                    current_error_rate = recent_errors / THROTTLING_WINDOW_SIZE
-
-            backoff_level, sleep_duration = check_and_apply_throttling(current_error_rate, backoff_level)
-
-            # If we slept, continue loop to re-check shutdown flag and error rate
-            if sleep_duration > 0:
-                continue
-
-            # --- Submit Task ---
-            # Ensure we don't submit more tasks than the pool can handle queueing
-            # Check queue size roughly (not perfectly accurate)
-            # This prevents memory exhaustion if tasks back up faster than workers process
-            # Note: _work_queue is internal, use with caution or implement custom queueing
-            if hasattr(executor, '_work_queue') and executor._work_queue.qsize() >= num_workers * 2:
-                time.sleep(0.05) # Short pause if queue is filling up
-                continue
-
-            future = executor.submit(make_request, url, requests_submitted + 1)
-            with results_lock:
-                 active_futures.append(future) # Track for shutdown
-            requests_submitted += 1
-
-            # --- Progress Logging ---
-            now = time.monotonic()
-            if now - last_progress_log_time >= 5.0: # Log progress every 5 seconds
-                current_total_completed = len(results_store)
-                requests_in_period = current_total_completed - last_progress_req_count
-                time_elapsed_period = now - last_progress_log_time
-                current_rps = requests_in_period / time_elapsed_period if time_elapsed_period > 0 else 0
-
-                logging.info(
-                    f"Progress: {requests_submitted}/{total_requests_target} submitted. "
-                    f"{current_total_completed} completed. "
-                    f"~{current_rps:.1f} RPS (last 5s). "
-                    f"Error rate (window): {current_error_rate:.2%}. "
-                    f"Active Workers: {len(executor._threads)}. "
-                    f"Queue Size: {executor._work_queue.qsize() if hasattr(executor, '_work_queue') else 'N/A'}."
-                )
-                last_progress_log_time = now
-                last_progress_req_count = current_total_completed
-
-        logging.info(f"--- All {requests_submitted}/{total_requests_target} requests submitted. Waiting for completion... ---")
-
-    except KeyboardInterrupt:
-        logging.warning("KeyboardInterrupt received during submission. Initiating graceful shutdown.")
-        shutdown_event.set()
-    except Exception as e:
-        logging.exception("An unexpected error occurred during test orchestration.")
-        shutdown_event.set()
-    finally:
-        # --- Graceful Shutdown ---
-        logging.info("Shutting down thread pool executor...")
-        # We don't submit new tasks now (due to loop break or exception)
-
-        # Wait for already submitted tasks to complete, up to a timeout
-        # Make a copy of the futures list to avoid issues if modified elsewhere
-        with results_lock:
-             futures_to_wait_for = list(active_futures)
-
-        # Using 'wait' allows for timeout and returns completed/not_completed sets
-        # (though we don't explicitly use the sets here, just wait)
-        # Set a reasonable timeout for pending tasks to finish
-        shutdown_wait_timeout = READ_TIMEOUT + CONNECT_TIMEOUT + 5.0 # Generous timeout
-        logging.info(f"Waiting up to {shutdown_wait_timeout:.1f} seconds for {len(futures_to_wait_for)} active tasks to complete...")
-        # executor.shutdown(wait=True) # This waits indefinitely, potentially blocking shutdown
-        # Use concurrent.futures.wait for timeout control
-        done, not_done = concurrent.futures.wait(futures_to_wait_for, timeout=shutdown_wait_timeout)
-
-        if not_done:
-            logging.warning(f"{len(not_done)} tasks did not complete within the shutdown timeout. Forcing shutdown.")
-            # Force shutdown - attempt to cancel remaining futures (may not work if running)
-            for future in not_done:
-                 future.cancel()
-            executor.shutdown(wait=False) 
-            # Don't wait further
-        else:
-            logging.info("All active tasks completed.")
-            executor.shutdown(wait=True) 
-            # Standard cleanup
-
-        logging.info("--- Stress Test Execution Phase Finished ---")
-        end_time = time.monotonic()
-        duration = end_time - start_time
-        # Analyze whatever results were collected, even if interrupted
-        analyze_results(results_store, duration)
-
+# --- Helpers ---
+def log_config_details():
+    logging.info("--- Configuration ---")
+    logging.info(f"Target: {TARGET_URL}, Requests: {NUM_REQUESTS}, Workers: {NUM_WORKERS}")
+    logging.info(f"Timeouts: {CONNECT_TIMEOUT}s connect, {READ_TIMEOUT}s read")
+    logging.info(f"Retries: {ENABLE_RETRIES}, max {MAX_RETRIES}, backoff {RETRY_BACKOFF_FACTOR}")
+    logging.info(f"Adaptive throttling: {ENABLE_ADAPTIVE_THROTTLING}, threshold {ERROR_THRESHOLD:.1%}")
+    logging.info("----------------------")
 
 def signal_handler(sig, frame):
-    """Sets the shutdown event when SIGINT or SIGTERM is received."""
-    logging.warning(f"Received signal {sig}. Initiating graceful shutdown...")
+    logging.warning(f"Signal {sig} received, shutting down...")
     shutdown_event.set()
-    # Wxit after a second signal if shutdown is stuck
-    signal.signal(sig, signal.SIG_DFL) 
-    # Register default handler for second signal
+    signal.signal(sig, signal.SIG_DFL)
 
-def log_config_details():
-    """Logs the configuration settings being used for the test run."""
-    logging.info("--- Configuration Settings ---")
-    logging.info(f"Target URL: {TARGET_URL}")
-    logging.info(f"Request Method: {REQUEST_METHOD}")
-    logging.info(f"Total Requests: {NUM_REQUESTS}")
-    logging.info(f"Concurrent Workers: {NUM_WORKERS}")
-    logging.info(f"Timeouts (Connect/Read): {CONNECT_TIMEOUT:.1f}s / {READ_TIMEOUT:.1f}s")
-    logging.info(f"Allow Redirects: {ALLOW_REDIRECTS}")
-    logging.info(f"Verify SSL: {VERIFY_SSL}")
-    logging.info(f"Stream Response Body: {STREAM_RESPONSE}")
-    logging.info(f"Custom Headers: {'Yes' if REQUEST_HEADERS else 'No'}")
-    logging.info(f"Retries Enabled: {ENABLE_RETRIES} (Max: {MAX_RETRIES}, Backoff: {RETRY_BACKOFF_FACTOR}, Statuses: {RETRY_ON_STATUS_CODES})")
-    logging.info(f"Adaptive Throttling Enabled: {ENABLE_ADAPTIVE_THROTTLING} (Threshold: {ERROR_THRESHOLD:.1%}, Window: {THROTTLING_WINDOW_SIZE})")
-    logging.info(f"Latency Percentiles: {LATENCY_PERCENTILES}")
-    logging.info(f"Log Level: {logging.getLevelName(LOG_LEVEL)}")
-    logging.info("-----------------------------")
+# --- Chaos Loop ---
+def _chaos_loop(monkey: ChaosMonkey):
+    while not shutdown_event.is_set():
+        time.sleep(random.uniform(CHAOS_INTERVAL_MIN, CHAOS_INTERVAL_MAX))
+        monkey.terminate_random_pod()
 
-# --- Phase 4 & 5 Commentary ---
-# Phase 4 (Bottleneck Analysis) & Phase 5 (Chaos Drills) remain external processes.
-# This script provides the load; analysis (Py-Spy, cProfile, DB tools) and chaos
-# injection (kube-monkey, network tools) happen concurrently or against the
-# environment being tested by this script. The improved telemetry output
-# (error types, detailed latencies) from this script aids in correlating
-# observations during those external activities.
+# --- Main Orchestration ---
+@profile
+def run_stress_test():
+    log_config_details()
+    start_http_server(8000)
+    chaos = ChaosMonkey()
+    threading.Thread(target=_chaos_loop, args=(chaos,), daemon=True, name="ChaosMonkey").start()
+    bucket = LeakyBucket(capacity=NUM_WORKERS*10, leak_rate=NUM_WORKERS/1.0)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=NUM_WORKERS)
+    start = time.monotonic()
+    submitted = 0
+    backoff_level = 0
 
+    while submitted < NUM_REQUESTS and not shutdown_event.is_set():
+        if not bucket.consume():
+            time.sleep(random.expovariate(1.0)); continue
+        backoff_level, slept = check_and_apply_throttling(backoff_level)
+        if slept>0: continue
+        fut = executor.submit(make_request, submitted+1, False)
+        with results_lock: active_futures.append(fut)
+        submitted += 1
+        now = time.monotonic()
+        if (submitted % 100)==0:
+            done = len(results_store)
+            logging.info(f"Progress: {submitted}/{NUM_REQUESTS} submitted, {done} done, ~{done/(now-start):.1f} RPS")
 
-# --- Main Execution ---
-if __name__ == "__main__":
-    # Register signal handlers for graceful shutdown
-    signal.signal(signal.SIGINT, signal_handler) # Ctrl+C
-    signal.signal(signal.SIGTERM, signal_handler) # kill command
+    logging.info("All requests submitted, awaiting completion...")
+    with results_lock: futures = list(active_futures)
+    done, pending = concurrent.futures.wait(futures, timeout=CONNECT_TIMEOUT+READ_TIMEOUT+5)
+    if pending:
+        logging.warning(f"{len(pending)} tasks unfinished, cancelling...")
+        for f in pending: f.cancel()
+        executor.shutdown(wait=False)
+    else:
+        executor.shutdown(wait=True)
+    duration = time.monotonic() - start
+    analyze_results(results_store, duration)
 
-    if TARGET_URL == "http://localhost:8000" or TARGET_URL == "http://example.com":
-      # For privacy reasons, I changed this
-        logging.warning("=" * 60)
-        logging.warning("WARNING: Target URL is set to a default/example.")
-        logging.warning("Please change the `TARGET_URL` variable in the script!")
-        logging.warning("Ensure you have permission to test the target system.")
-        logging.warning("=" * 60)
-
-    # Run the main test function
-    run_stress_test(TARGET_URL, NUM_REQUESTS, NUM_WORKERS)
-
-    logging.info("--- Script Finished ---")
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    if TARGET_URL.startswith('http://localhost'):
+        logging.warning("Using default localhost URL—update TARGET_URL for real tests.")
+    # Start py-spy for live profiling
+    Popen(['py-spy', 'top', '--pid', str(os.getpid())])
+    run_stress_test()
+    logging.info("Script completed.")
